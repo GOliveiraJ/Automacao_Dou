@@ -1,0 +1,97 @@
+import pandas as pd
+import warnings
+warnings.filterwarnings('ignore') # Ignora avisos do Excel
+
+# --- CONFIGURAÇÃO ---
+ARQUIVO_EXCEL = "(COPIA DE SEGURANÇA) CONTROLE DOS PRAZOS DE ANÁLISE_CCTAB_2025.xlsx"
+
+# Lista de abas que o script vai procurar (com e sem acento para evitar erros)
+ABAS_ALVO = ["MÁRCIA", "PATRÍCIA", "THAÍLA", "CLEICI", "MARCIA", "PATRICIA", "THAILA"]
+
+def limpar_texto(texto):
+    if pd.isna(texto): return ""
+    return str(texto).strip().upper()
+
+def extrair_ano(data_valor):
+    """Extrai o ano da data de publicação"""
+    if pd.isna(data_valor):
+        return None
+    
+    if hasattr(data_valor, 'year'):
+        return str(data_valor.year)
+        
+    texto_data = str(data_valor).strip()
+    if len(texto_data) >= 4:
+        if '/' in texto_data:
+            partes = texto_data.split('/')
+            if len(partes[-1]) == 4:
+                return partes[-1]
+        elif '-' in texto_data:
+            partes = texto_data.split('-')
+            if len(partes[0]) == 4:
+                return partes[0]
+    
+    return "Ano Desconhecido"
+
+def gerar_quantitativo_2026():
+    print("=" * 60)
+    print(" EXTRATOR DE DADOS - APENAS 2026 ".center(60))
+    print("=" * 60 + "\n")
+
+    try:
+        print(f"Lendo o arquivo: {ARQUIVO_EXCEL}...")
+        xls = pd.ExcelFile(ARQUIVO_EXCEL)
+        dfs_para_juntar = []
+        
+        # 1. Loop inteligente: procura apenas as abas das 4 responsáveis
+        for nome_aba in xls.sheet_names:
+            if nome_aba.strip().upper() in ABAS_ALVO:
+                df_temp = pd.read_excel(xls, sheet_name=nome_aba)
+                dfs_para_juntar.append(df_temp)
+                
+        if not dfs_para_juntar:
+            print("Nenhuma das abas alvo (Márcia, Patrícia, Thaíla, Cleici) foi encontrada.")
+            return
+            
+        # Junta todas as abas encontradas em uma única super tabela
+        df_total = pd.concat(dfs_para_juntar, ignore_index=True)
+        
+    except Exception as e:
+        print(f"Erro ao abrir a planilha de Controle: {e}")
+        return
+
+    # 2. Filtra apenas quem tem Data de Publicação preenchida
+    df_publicados = df_total.dropna(subset=['DATA DE PUBLICAÇÃO']).copy()
+    df_publicados = df_publicados[df_publicados['DATA DE PUBLICAÇÃO'].astype(str).str.strip() != '']
+
+    if df_publicados.empty:
+        print("Nenhum expediente com Data de Publicação encontrado.")
+        return
+
+    # 3. Limpeza de dados
+    df_publicados['PETIÇÃO'] = df_publicados['PETIÇÃO'].apply(limpar_texto)
+    df_publicados['SITUAÇÃO DA PETIÇÃO'] = df_publicados['SITUAÇÃO DA PETIÇÃO'].apply(limpar_texto)
+    df_publicados['ANO_PUBLICACAO'] = df_publicados['DATA DE PUBLICAÇÃO'].apply(extrair_ano)
+
+    # 4. FILTRO DE OURO: Apenas ano 2026
+    df_2026 = df_publicados[df_publicados['ANO_PUBLICACAO'] == '2026']
+
+    if df_2026.empty:
+        print("Nenhum expediente publicado no ano de 2026 foi encontrado na planilha.")
+        return
+
+    # 5. Fazendo a contagem exata para 2026
+    reg_def = len(df_2026[(df_2026['PETIÇÃO'] == 'REGISTRO') & (df_2026['SITUAÇÃO DA PETIÇÃO'] == 'DEFERIDO')])
+    reg_indef = len(df_2026[(df_2026['PETIÇÃO'] == 'REGISTRO') & (df_2026['SITUAÇÃO DA PETIÇÃO'] == 'INDEFERIDO')])
+    
+    ren_def = len(df_2026[(df_2026['PETIÇÃO'] == 'RENOVAÇÃO') & (df_2026['SITUAÇÃO DA PETIÇÃO'] == 'DEFERIDO')])
+    ren_indef = len(df_2026[(df_2026['PETIÇÃO'] == 'RENOVAÇÃO') & (df_2026['SITUAÇÃO DA PETIÇÃO'] == 'INDEFERIDO')])
+    
+    # 6. Imprime o resultado formatado
+    print(f"\n--- RESULTADOS DO ANO 2026 (MÁRCIA, PATRÍCIA, THAÍLA, CLEICI) ---")
+    print(f" 6001 (REGISTRO):  def.: {reg_def:<4} | indef.: {reg_indef}")
+    print(f" 6003 (RENOVAÇÃO): def.: {ren_def:<4} | indef.: {ren_indef}\n")
+    print("=" * 60)
+
+if __name__ == "__main__":
+    gerar_quantitativo_2026()
