@@ -45,3 +45,29 @@ garanta que a estrutura do diretório esteja assim:
 
  Para rodar o script no modo padrão (atualizando o Excel e criando o backup):
  python atualizador_dou_v2.py
+
+ # 📊 Extrator de Quantitativos GGTAB (Foco 2026)
+
+Um script em Python desenvolvido com a biblioteca Pandas para automatizar a leitura, limpeza e consolidação de dados de uma planilha de controle de prazos regulatórios da ANVISA. 
+
+O projeto resolve o problema da extração manual de métricas, filtrando automaticamente as abas de membros específicos da equipe e gerando um relatório quantitativo exato dos processos de 2026, separados por tipo de petição e status de deferimento.
+
+## 🚀 Principais Funcionalidades
+
+- **Leitura Seletiva de Abas:** O script varre o arquivo Excel e extrai dados apenas das abas de responsáveis pré-definidas, ignorando formatações inconsistentes (com ou sem acento).
+- **Consolidação de Dados (Concat):** Junta as informações das diferentes abas em um único DataFrame para análise unificada.
+- **Tratamento Inteligente de Datas:** Uma função dedicada para extrair o ano de publicação, capaz de lidar tanto com objetos `datetime` nativos do Excel quanto com strings formatadas de diferentes maneiras (ex: DD/MM/AAAA ou AAAA-MM-DD).
+- **Geração de Relatório Gerencial:** Filtra os dados exclusivamente para o ano de 2026 e realiza a contagem cruzada para petições de "Registro (6001)" e "Renovação (6003)", categorizando entre Deferidos e Indeferidos.
+
+## 🛠️ Tecnologias Utilizadas
+
+- **Python 3.8+**
+- **[Pandas](https://pandas.pydata.org/):** Para ingestão, limpeza, transformação e agregação dos dados tabulares.
+- **[OpenPyXL](https://openpyxl.readthedocs.io/):** Motor de leitura de arquivos Excel (`.xlsx`) utilizado nos bastidores pelo Pandas.
+
+## 📦 Como Instalar e Rodar
+
+1. Clone o repositório para o seu ambiente local:
+   ```bash
+   git clone [https://github.com/seu-usuario/nome-do-repositorio.git](https://github.com/seu-usuario/nome-do-repositorio.git)
+   cd nome-do-repositorio
