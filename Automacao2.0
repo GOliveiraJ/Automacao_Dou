@@ -1,0 +1,546 @@
+"""
+================================================================================
+Atualizador de Prazos — DOU → Excel
+================================================================================
+Versão  : 2.0
+Uso     : python atualizador_dou_v2.py [--dry-run] [--verbose]
+
+Descrição:
+    Lê os PDFs do Diário Oficial da União na pasta configurada, extrai as
+    datas de publicação e os números de expediente, e preenche a coluna
+    "DATA DE PUBLICAÇÃO" nas abas correspondentes do arquivo Excel de
+    controle de prazos — somente quando a célula estiver vazia.
+
+    Antes de salvar, cria automaticamente um backup com timestamp do Excel
+    original. Ao final, exibe um relatório consolidado por aba.
+
+Flags:
+    --dry-run   Simula toda a execução sem modificar ou salvar nenhum arquivo.
+    --verbose   Exibe no terminal cada PDF processado, mesmo sem dados novos.
+
+Dependências:
+    pip install pdfplumber openpyxl
+================================================================================
+"""
+
+# ==============================================================================
+# 1. IMPORTS
+# ==============================================================================
+
+import argparse
+import logging
+import os
+import re
+import shutil
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+
+import openpyxl
+import pdfplumber
+
+# ==============================================================================
+# 2. CONFIGURAÇÕES CENTRALIZADAS
+# ==============================================================================
+# Toda configuração do script fica aqui. Ao mudar de planilha ou pasta,
+# edite apenas esta seção — sem precisar caçar valores espalhados no código.
+# ==============================================================================
+
+@dataclass(frozen=True)
+class Config:
+    """Parâmetros de execução do atualizador."""
+
+    # --- Caminhos ---
+    arquivo_excel: Path = Path(
+        "(COPIA DE SEGURANÇA) CONTROLE DOS PRAZOS DE ANÁLISE_CCTAB_2025.xlsx"
+    )
+    pasta_pdfs: Path = Path("arquivos_dou")
+    arquivo_saida: Path = Path("CONTROLE_ATUALIZADO_COM_FORMULAS.xlsx")
+
+    # --- Colunas alvo no Excel ---
+    coluna_expediente: str = "EXPEDIENTE"
+    coluna_data_pub:   str = "DATA DE PUBLICAÇÃO"
+
+    # --- Abas que devem ser atualizadas ---
+    # A normalização (maiúsculas + strip) é feita em runtime,
+    # por isso basta listar os nomes canônicos aqui.
+    abas_alvo: Tuple[str, ...] = ("MÁRCIA", "PATRÍCIA", "THAÍLA", "CLEICI")
+
+    # --- Performance ---
+    max_workers_pdf: int = 4  # Threads para leitura paralela de PDFs
+
+    # Mapa de meses em português para o número correspondente
+    meses: Dict[str, str] = field(default_factory=lambda: {
+        "janeiro": "01", "fevereiro": "02", "março":    "03",
+        "abril":   "04", "maio":      "05", "junho":    "06",
+        "julho":   "07", "agosto":    "08", "setembro": "09",
+        "outubro": "10", "novembro":  "11", "dezembro": "12",
+    })
+
+
+# Instância global da configuração
+CFG = Config()
+
+# ==============================================================================
+# 3. LOGGING
+# ==============================================================================
+# logging.getLogger() é preferível a print() porque:
+#   • permite filtrar mensagens por nível (DEBUG, INFO, WARNING, ERROR)
+#   • registra automaticamente data/hora
+#   • pode ser redirecionado para arquivo sem alterar o código
+# ==============================================================================
+
+def configurar_logging(verbose: bool) -> None:
+    """Configura o logger raiz com o nível adequado ao modo de execução."""
+    nivel = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=nivel,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+
+
+logger = logging.getLogger(__name__)
+
+# ==============================================================================
+# 4. UTILITÁRIOS
+# ==============================================================================
+
+def normalizar_expediente(texto: Optional[str]) -> str:
+    """
+    Remove espaços e caracteres de controle de um número de expediente
+    para garantir o match entre o valor do Excel e o extraído do PDF.
+
+    Exemplo: "1234567 / 25 - 1" → "1234567/25-1"
+
+    Args:
+        texto: Valor bruto da célula ou do regex.
+
+    Returns:
+        String sem espaços, ou "" se a entrada for None/vazia.
+    """
+    if not texto:
+        return ""
+    return re.sub(r"\s+", "", str(texto)).strip()
+
+
+def normalizar_nome_aba(nome: str) -> str:
+    """Retorna o nome da aba em maiúsculas e sem espaços extras."""
+    return nome.strip().upper()
+
+
+def fazer_backup_excel(caminho_original: Path) -> Path:
+    """
+    Copia o arquivo Excel original para um backup com timestamp.
+
+    O backup é criado na mesma pasta do original, com o sufixo
+    "_bkp_YYYYMMDD_HHMMSS" antes da extensão.
+
+    Args:
+        caminho_original: Caminho do arquivo a ser copiado.
+
+    Returns:
+        Caminho do arquivo de backup criado.
+
+    Raises:
+        OSError: Se não for possível copiar o arquivo.
+    """
+    ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
+    nome_bkp = f"{caminho_original.stem}_bkp_{ts}{caminho_original.suffix}"
+    destino = caminho_original.parent / nome_bkp
+    shutil.copy2(caminho_original, destino)
+    return destino
+
+
+# ==============================================================================
+# 5. EXTRAÇÃO DE DADOS DOS PDFs
+# ==============================================================================
+
+def extrair_dados_pdf(caminho_pdf: Path) -> Tuple[Optional[str], Set[str]]:
+    """
+    Extrai a data de publicação e os números de expediente de um PDF do DOU.
+
+    Estratégia:
+        1. Concatena o texto de todas as páginas do PDF.
+        2. Busca a data no cabeçalho com o padrão "Brasília, DD de Mês de AAAA".
+        3. Busca expedientes no padrão "NNNNNNN/AA-D" (com variações de espaçamento).
+
+    Args:
+        caminho_pdf: Caminho do arquivo PDF.
+
+    Returns:
+        Tupla (data_formatada, conjunto_de_expedientes).
+        data_formatada é None se não encontrada.
+        conjunto_de_expedientes pode ser vazio.
+    """
+    texto_completo = ""
+
+    # Extração de texto: itera por página para liberar memória progressivamente
+    try:
+        with pdfplumber.open(caminho_pdf) as pdf:
+            for pagina in pdf.pages:
+                conteudo = pagina.extract_text()
+                if conteudo:
+                    texto_completo += conteudo + "\n"
+    except Exception as exc:
+        logger.error("Falha ao ler '%s': %s", caminho_pdf.name, exc)
+        return None, set()
+
+    if not texto_completo.strip():
+        logger.warning("PDF vazio ou sem texto extraível: %s", caminho_pdf.name)
+        return None, set()
+
+    # --- Extração da data de publicação ---
+    # Padrão: "Brasília, 5 de março de 2025" (variações de espaço toleradas)
+    data_encontrada: Optional[str] = None
+    match_data = re.search(
+        r"Bras[ií]lia[^,]*,?\s*(\d{1,2})\s+de\s+([a-záéíóúãõç]+)\s+de\s+(\d{4})",
+        texto_completo,
+        re.IGNORECASE,
+    )
+    if match_data:
+        dia, mes_extenso, ano = match_data.groups()
+        mes_num = CFG.meses.get(mes_extenso.lower())
+        if mes_num:
+            data_encontrada = f"{int(dia):02d}/{mes_num}/{ano}"
+        else:
+            logger.warning(
+                "Mês não reconhecido '%s' em '%s'.", mes_extenso, caminho_pdf.name
+            )
+
+    # --- Extração de expedientes ---
+    # Padrão: 7 dígitos / 2 dígitos - 1 dígito (espaços opcionais ao redor de / e -)
+    matches_exp = re.findall(
+        r"\b(\d{7}\s*/\s*\d{2}\s*-\s*\d)\b",
+        texto_completo,
+    )
+    expedientes: Set[str] = {normalizar_expediente(m) for m in matches_exp}
+
+    logger.debug(
+        "%s → data=%s | expedientes=%d", caminho_pdf.name, data_encontrada, len(expedientes)
+    )
+    return data_encontrada, expedientes
+
+
+def mapear_pdfs(pasta: Path, max_workers: int) -> Dict[str, str]:
+    """
+    Lê todos os PDFs da pasta em paralelo e constrói um dicionário
+    {expediente_normalizado: data_formatada}.
+
+    Usar ThreadPoolExecutor com pdfplumber é seguro: cada thread abre
+    seu próprio file handle e não compartilha estado mutável.
+
+    Args:
+        pasta      : Diretório onde estão os PDFs.
+        max_workers: Número máximo de threads simultâneas.
+
+    Returns:
+        Dicionário mapeando expediente → data de publicação.
+    """
+    arquivos_pdf = sorted(pasta.glob("*.pdf"))
+    if not arquivos_pdf:
+        logger.warning("Nenhum PDF encontrado em '%s'.", pasta)
+        return {}
+
+    logger.info("Encontrados %d PDF(s). Lendo em paralelo (%d threads)...",
+                len(arquivos_pdf), max_workers)
+
+    mapa: Dict[str, str] = {}
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submete uma tarefa de extração para cada PDF
+        futures = {executor.submit(extrair_dados_pdf, pdf): pdf for pdf in arquivos_pdf}
+
+        for future in as_completed(futures):
+            pdf_path = futures[future]
+            try:
+                data, expedientes = future.result()
+                if data:
+                    for exp in expedientes:
+                        # Se dois PDFs contiverem o mesmo expediente,
+                        # prevalece o último processado (ordem não garantida).
+                        # Situação incomum, mas logamos para rastreabilidade.
+                        if exp in mapa and mapa[exp] != data:
+                            logger.warning(
+                                "Expediente '%s' encontrado em mais de um PDF "
+                                "(datas: %s e %s). Mantendo '%s'.",
+                                exp, mapa[exp], data, mapa[exp],
+                            )
+                        else:
+                            mapa[exp] = data
+            except Exception as exc:
+                logger.error("Erro ao processar '%s': %s", pdf_path.name, exc)
+
+    logger.info("Mapa de expedientes construído: %d entradas.", len(mapa))
+    return mapa
+
+
+# ==============================================================================
+# 6. ATUALIZAÇÃO DO EXCEL
+# ==============================================================================
+
+@dataclass
+class ResultadoAba:
+    """Contagem de resultados para uma aba específica do Excel."""
+    nome:           str
+    atualizados:    int = 0
+    ja_preenchidos: int = 0
+    nao_encontrados: int = 0
+
+
+def atualizar_excel(
+    caminho: Path,
+    mapa: Dict[str, str],
+    dry_run: bool,
+) -> Tuple[List[ResultadoAba], int]:
+    """
+    Abre o Excel e preenche a coluna de data de publicação onde estiver vazia.
+
+    Somente as abas listadas em CFG.abas_alvo são processadas. Somente
+    células vazias são alteradas — células já preenchidas são respeitadas.
+
+    Args:
+        caminho: Caminho do arquivo Excel de entrada.
+        mapa   : Dicionário {expediente: data} extraído dos PDFs.
+        dry_run: Se True, não salva nenhuma alteração.
+
+    Returns:
+        Tupla (lista de ResultadoAba por aba, total de atualizações).
+    """
+    try:
+        wb = openpyxl.load_workbook(caminho)
+    except Exception as exc:
+        logger.error("Não foi possível abrir o Excel: %s", exc)
+        raise
+
+    # Normaliza os nomes-alvo para comparação sem acento e case-insensitive
+    abas_alvo_norm: Set[str] = {normalizar_nome_aba(a) for a in CFG.abas_alvo}
+
+    resultados_por_aba: List[ResultadoAba] = []
+    total_atualizados  = 0
+
+    for sheet in wb.worksheets:
+        nome_norm = normalizar_nome_aba(sheet.title)
+
+        # Ignora abas fora da lista configurada
+        if nome_norm not in abas_alvo_norm:
+            logger.debug("Aba ignorada: '%s'.", sheet.title)
+            continue
+
+        resultado = ResultadoAba(nome=sheet.title)
+
+        # --- Localizar índices das colunas no cabeçalho (linha 1) ---
+        idx_exp  = None
+        idx_data = None
+        for celula in sheet[1]:
+            valor_cabecalho = str(celula.value or "").strip()
+            if valor_cabecalho == CFG.coluna_expediente:
+                idx_exp = celula.column
+            elif valor_cabecalho == CFG.coluna_data_pub:
+                idx_data = celula.column
+
+        if idx_exp is None or idx_data is None:
+            logger.warning(
+                "Aba '%s': colunas '%s' e/ou '%s' não encontradas no cabeçalho. Pulando.",
+                sheet.title, CFG.coluna_expediente, CFG.coluna_data_pub,
+            )
+            continue
+
+        # --- Iterar pelas linhas de dados (a partir da linha 2) ---
+        for linha in sheet.iter_rows(min_row=2):
+            celula_exp  = linha[idx_exp  - 1]
+            celula_data = linha[idx_data - 1]
+
+            exp_normalizado = normalizar_expediente(celula_exp.value)
+            if not exp_normalizado:
+                continue  # Linha vazia ou sem expediente — ignora
+
+            if exp_normalizado in mapa:
+                if celula_data.value:
+                    # Data já preenchida: respeita o valor existente
+                    resultado.ja_preenchidos += 1
+                else:
+                    # Célula vazia: preenche com a data extraída do PDF
+                    nova_data = mapa[exp_normalizado]
+
+                    if not dry_run:
+                        celula_data.value = nova_data
+
+                    resultado.atualizados += 1
+                    total_atualizados     += 1
+                    logger.info(
+                        "[%s] Linha %-4d | Exp: %-15s | Data: %s%s",
+                        sheet.title,
+                        celula_exp.row,
+                        exp_normalizado,
+                        nova_data,
+                        "  [DRY-RUN]" if dry_run else "",
+                    )
+            else:
+                resultado.nao_encontrados += 1
+
+        resultados_por_aba.append(resultado)
+
+    # --- Backup + salvamento ---
+    if not dry_run and total_atualizados > 0:
+        backup_path = fazer_backup_excel(caminho)
+        logger.info("Backup criado: %s", backup_path.name)
+
+        wb.save(CFG.arquivo_saida)
+        logger.info("Arquivo salvo: %s", CFG.arquivo_saida)
+    elif dry_run:
+        logger.info("[DRY-RUN] Nenhum arquivo foi modificado.")
+    else:
+        logger.info("Nenhuma atualização necessária. Arquivo não modificado.")
+
+    return resultados_por_aba, total_atualizados
+
+
+# ==============================================================================
+# 7. RELATÓRIO FINAL
+# ==============================================================================
+
+def imprimir_relatorio(
+    resultados: List[ResultadoAba],
+    total: int,
+    dry_run: bool,
+    duracao_seg: float,
+) -> None:
+    """
+    Exibe no terminal um resumo consolidado das atualizações realizadas.
+
+    Args:
+        resultados  : Lista de ResultadoAba com contagens por aba.
+        total       : Total de células atualizadas.
+        dry_run     : Se True, exibe aviso de simulação.
+        duracao_seg : Tempo total de execução em segundos.
+    """
+    largura = 70
+    print()
+    print("=" * largura)
+    print(" RELATÓRIO DE EXECUÇÃO ".center(largura))
+    if dry_run:
+        print(" *** MODO DRY-RUN — nenhum arquivo foi alterado *** ".center(largura))
+    print("=" * largura)
+
+    if not resultados:
+        print("  Nenhuma aba correspondente foi encontrada no Excel.")
+    else:
+        print(f"  {'Aba':<20} {'Atualizados':>12} {'Já preen.':>10} {'Não econtr.':>12}")
+        print("  " + "-" * (largura - 2))
+        for r in resultados:
+            print(
+                f"  {r.nome:<20} {r.atualizados:>12} "
+                f"{r.ja_preenchidos:>10} {r.nao_encontrados:>12}"
+            )
+        print("  " + "=" * (largura - 2))
+        print(f"  {'TOTAL':<20} {total:>12}")
+
+    print("-" * largura)
+    print(f"  Tempo total: {duracao_seg:.1f}s")
+    if not dry_run and total > 0:
+        print(f"  Arquivo salvo como: {CFG.arquivo_saida}")
+    print("=" * largura)
+    print()
+
+
+# ==============================================================================
+# 8. VALIDAÇÃO DE AMBIENTE
+# ==============================================================================
+
+def validar_ambiente() -> bool:
+    """
+    Verifica se os arquivos e pastas necessários existem antes de iniciar.
+
+    Retorna False (e loga os erros) se qualquer dependência estiver faltando,
+    evitando que o script falhe no meio da execução.
+
+    Returns:
+        True se tudo estiver em ordem, False caso contrário.
+    """
+    ok = True
+
+    if not CFG.pasta_pdfs.exists():
+        logger.error("Pasta de PDFs não encontrada: '%s'.", CFG.pasta_pdfs)
+        ok = False
+
+    if not CFG.arquivo_excel.exists():
+        logger.error("Arquivo Excel não encontrado: '%s'.", CFG.arquivo_excel)
+        ok = False
+
+    return ok
+
+
+# ==============================================================================
+# 9. PONTO DE ENTRADA
+# ==============================================================================
+
+def parse_args() -> argparse.Namespace:
+    """Define e analisa os argumentos de linha de comando."""
+    parser = argparse.ArgumentParser(
+        description="Atualiza datas de publicação no Excel a partir de PDFs do DOU.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Simula a execução sem salvar ou modificar nenhum arquivo.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Exibe mensagens de debug detalhadas (inclui PDFs sem dados novos).",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    inicio = datetime.now()
+    args   = parse_args()
+
+    configurar_logging(args.verbose)
+
+    print()
+    print("=" * 70)
+    print(" ATUALIZADOR DE PRAZOS (DOU → Excel) ".center(70))
+    if args.dry_run:
+        print(" *** MODO DRY-RUN ATIVADO — nenhum arquivo será alterado *** ".center(70))
+    print("=" * 70)
+    print()
+
+    # 1. Validação do ambiente
+    logger.info("Verificando ambiente...")
+    if not validar_ambiente():
+        logger.error("Corrija os erros acima e execute novamente.")
+        sys.exit(1)
+
+    # 2. Leitura e mapeamento dos PDFs (em paralelo)
+    logger.info("Etapa 1/2 — Lendo PDFs em '%s'...", CFG.pasta_pdfs)
+    mapa_expediente_data = mapear_pdfs(CFG.pasta_pdfs, CFG.max_workers_pdf)
+
+    if not mapa_expediente_data:
+        logger.warning(
+            "Nenhum expediente extraído dos PDFs. "
+            "Verifique se os arquivos estão corretos e tente novamente."
+        )
+        sys.exit(0)
+
+    # 3. Atualização do Excel
+    logger.info("Etapa 2/2 — Atualizando '%s'...", CFG.arquivo_excel)
+    try:
+        resultados, total = atualizar_excel(CFG.arquivo_excel, mapa_expediente_data, args.dry_run)
+    except Exception:
+        logger.exception("Erro crítico durante a atualização do Excel.")
+        sys.exit(1)
+
+    # 4. Relatório final
+    duracao = (datetime.now() - inicio).total_seconds()
+    imprimir_relatorio(resultados, total, args.dry_run, duracao)
+
+
+if __name__ == "__main__":
+    main()
